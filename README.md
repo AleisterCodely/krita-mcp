@@ -1,26 +1,21 @@
 # Krita MCP Server
 
-Let AI paint in [Krita](https://krita.org/) via the [Model Context Protocol](https://modelcontextprotocol.io/).
-
-This bridge allows Claude (or any MCP client) to create canvases, paint strokes, draw shapes, export images, and more — all inside a running Krita instance.
-
-## How It Works
-
-Two components:
-
-1. **Krita Plugin** (`krita-plugin/`) — A Python plugin that runs inside Krita, exposing an HTTP server on `localhost:5678`. It receives paint commands and executes them on Krita's main thread via a command queue.
-
-2. **MCP Server** (`server.py`) — A [FastMCP](https://github.com/jlowin/fastmcp) server that exposes painting tools to any MCP client. It translates MCP tool calls into HTTP requests to the Krita plugin.
+Let AI agents paint in [Krita](https://krita.org/) via the [Model Context Protocol](https://modelcontextprotocol.io/): canvases, layers and groups, strokes with Krita's real brush engine, shapes, filters, layered `.kra` saves and per-layer PNG exports for game engines.
 
 ```
-MCP Client (Claude, etc.)  ←→  MCP Server (server.py)  ←→  Krita Plugin (HTTP on :5678)  ←→  Krita
+MCP client (Codex, Claude, ...) ⇄ MCP server (server.py) ⇄ Krita plugin (HTTP on 127.0.0.1:5678 + token) ⇄ Krita
 ```
+
+1. **Krita plugin** (`krita-plugin/`) runs inside Krita. It serves a loopback-only HTTP bridge and runs each command on Krita's main thread.
+2. **MCP server** (`server.py`) is a [FastMCP](https://github.com/jlowin/fastmcp) server that turns tool calls into authenticated requests to the plugin.
+
+Requires Krita 5.x for the native brush engine (`engine="native"`, the default). On older builds use `engine="pixel"`.
 
 ## Setup
 
-### 1. Install the Krita Plugin
+### 1. Install the Krita plugin
 
-Copy the plugin files to your Krita plugins directory:
+Copy `krita-plugin/kritamcp/` (the whole folder) and `krita-plugin/kritamcp.desktop` into your Krita `pykrita` folder:
 
 | OS | Path |
 |----|------|
@@ -28,114 +23,109 @@ Copy the plugin files to your Krita plugins directory:
 | Linux | `~/.local/share/krita/pykrita/` |
 | macOS | `~/Library/Application Support/krita/pykrita/` |
 
-Copy both:
-- `krita-plugin/kritamcp/` (the folder with `__init__.py`)
-- `krita-plugin/kritamcp.desktop`
+Enable it in **Settings → Configure Krita → Python Plugin Manager → Krita MCP Bridge**, then restart Krita. On first start the plugin creates `~/.config/krita-mcp/token` (on Windows: `C:\Users\<you>\.config\krita-mcp\token`).
 
-Then in Krita: **Settings → Configure Krita → Python Plugin Manager → Enable "Krita MCP Bridge"** and restart Krita.
+### 2. Install the MCP server
 
-### 2. Install the MCP Server
-
-```bash
-pip install fastmcp httpx
-```
-
-Or with a virtual environment:
 ```bash
 python -m venv .venv
-source .venv/bin/activate  # or .venv\Scripts\activate on Windows
+source .venv/bin/activate        # Windows: .venv\Scripts\activate
 pip install -r requirements.txt
 ```
 
-### 3. Configure Your MCP Client
+### 3. Configure your MCP client
 
-Add to your MCP client config (e.g., Claude Desktop's `claude_desktop_config.json`):
+**Codex** (`~/.codex/config.toml`):
+
+```toml
+[mcp_servers.krita]
+command = "/path/to/krita-mcp/.venv/bin/python"   # Windows: C:\\path\\to\\krita-mcp\\.venv\\Scripts\\python.exe
+args = ["/path/to/krita-mcp/server.py"]
+tool_timeout_sec = 300   # saves, exports and filters on big canvases can be slow
+```
+
+**Claude Desktop** (`claude_desktop_config.json`):
 
 ```json
 {
   "mcpServers": {
     "krita": {
-      "command": "python",
-      "args": ["/path/to/server.py"]
+      "command": "/path/to/krita-mcp/.venv/bin/python",
+      "args": ["/path/to/krita-mcp/server.py"]
     }
   }
 }
 ```
 
-If using a virtual environment:
-```json
-{
-  "mcpServers": {
-    "krita": {
-      "command": "/path/to/.venv/Scripts/python",
-      "args": ["/path/to/server.py"]
-    }
-  }
-}
-```
+The server reads the token file automatically. Start Krita before your agent's first Krita call.
 
-## Available Tools
+## Security model
 
-| Tool | Description |
-|------|-------------|
-| `krita_health` | Check if Krita is running with the plugin active |
-| `krita_new_canvas` | Create a new canvas (width, height, background color) |
-| `krita_set_color` | Set foreground paint color (hex) |
-| `krita_set_brush` | Set brush preset, size, and opacity |
-| `krita_stroke` | Paint a stroke through a list of [x, y] points |
-| `krita_fill` | Fill a circular area at a point |
-| `krita_draw_shape` | Draw rectangle, ellipse, or line |
-| `krita_get_canvas` | Export canvas to PNG (for AI to see progress) |
-| `krita_save` | Save canvas to a specific file path |
-| `krita_undo` / `krita_redo` | Undo/redo actions |
-| `krita_clear` | Clear canvas to a solid color |
-| `krita_get_color_at` | Eyedropper — sample color at a pixel |
-| `krita_list_brushes` | List available brush presets |
-| `krita_open_file` | Open an existing .kra, .png, .jpg, etc. |
+The plugin's HTTP bridge can paint, open files and save files, so it is locked down:
 
-## The Export Timeout Fix
+- **Loopback only:** binds to `127.0.0.1`, never all interfaces.
+- **Shared-secret token:** every request needs the `X-Krita-MCP-Token` header matching `~/.config/krita-mcp/token` (created with owner-only permissions). Delete the file and restart Krita to rotate it.
+- **No browsers:** requests with an `Origin` header are rejected, the `Host` header must be `127.0.0.1:<port>` or `localhost:<port>` (blocks DNS rebinding), and POSTs must be `application/json` (blocks "simple" cross-site requests). CORS preflights are refused.
+- **Path sandbox:** open/save/export only work inside the output folder (default `~/krita-mcp-output`) and folders you list in `allowed_dirs`. Symlink and `..` escapes are resolved and refused, and the token folder is always off-limits. Relative paths go to the output folder. Only image/`.kra` extensions are allowed.
+- **No silent overwrites:** `krita_save` and `krita_export_layers` refuse to replace existing files unless `overwrite=true`.
+- **Limits:** body size, canvas size, brush size and point counts are capped so a bad call can't hang Krita.
 
-**This is the main reason this repo exists.**
-
-By default, HTTP requests and command queue operations time out after ~30 seconds. Canvas export (`get_canvas`) and file save (`save`) operations can easily exceed this on larger canvases, causing silent failures or timeout errors.
-
-The fix is applied in two places:
-
-**MCP Server (`server.py`)** — Extended timeout for export/save commands:
-```python
-# In krita_get_canvas and krita_save:
-result = send_command("get_canvas", {"filename": filename}, timeout=120.0)
-result = send_command("save", {"path": path}, timeout=120.0)
-```
-
-**Krita Plugin (`__init__.py`)** — Matching timeout in the command queue:
-```python
-def get_result(self, command_id, timeout=120):
-    """Wait for result with timeout."""
-    for _ in range(int(timeout * 10)):  # Check every 100ms
-        ...
-```
-
-**Both sides must match.** If only the MCP server timeout is increased, the plugin's command queue will still time out at 30s. If only the plugin timeout is increased, the HTTP request from the MCP server will time out first.
+Any process running as your own user can still read the token. That is the same trust boundary as everything else in your account; the goal is to stop web pages and other users.
 
 ## Configuration
 
-| Setting | Default | How to Change |
-|---------|---------|---------------|
-| Plugin HTTP port | `5678` | Edit `SERVER_PORT` in plugin `__init__.py` |
-| MCP server URL | `http://localhost:5678` | Set `KRITA_URL` env var |
-| Canvas output dir | `~/krita-mcp-output` | Edit `CANVAS_OUTPUT_DIR` in plugin `__init__.py` |
+Optional `~/.config/krita-mcp/config.json`, read by the plugin at Krita startup:
 
-## Painting Approach
+```json
+{
+  "port": 5678,
+  "output_dir": "~/krita-mcp-output",
+  "allowed_dirs": ["~/games/my-game/assets/art"]
+}
+```
 
-The plugin paints using **direct pixel manipulation** (not Krita's native brush engine for strokes). This means:
+| Setting | Env override | Notes |
+|---------|--------------|-------|
+| `port` | `KRITA_MCP_PORT` | Set `KRITA_URL=http://127.0.0.1:<port>` for the MCP server too |
+| `output_dir` | `KRITA_MCP_OUTPUT_DIR` | Default save/export location |
+| `allowed_dirs` | `KRITA_MCP_ALLOWED_DIRS` (path-separator list, appended) | Extra folders the agent may open/save in |
+| token | `KRITA_MCP_TOKEN` (server side) | Normally read from the token file |
 
-- Strokes use a custom soft-circle renderer with configurable hardness
-- Alpha blending is done manually in BGRA pixel format
-- Shapes (rectangle, ellipse, line) are rasterized directly
-- This approach is reliable and doesn't depend on Krita's internal brush state
+## Tools
 
-The `set_brush` tool does set Krita's brush preset (for potential future use), but `stroke` currently uses its own pixel-level rendering.
+| Area | Tools |
+|------|-------|
+| Status | `krita_health`, `krita_status` (document, active layer, brush, colors, allowed folders) |
+| Documents | `krita_new_canvas`, `krita_open_file`, `krita_save`, `krita_export_layers`, `krita_get_canvas`, `krita_undo`, `krita_redo` |
+| Brush | `krita_set_brush` (preset, size, opacity, flow, blend mode), `krita_set_color` (fg/bg), `krita_list_brushes` |
+| Painting | `krita_stroke`, `krita_draw_shape` (rectangle, ellipse, polygon, line), `krita_fill`, `krita_clear`, `krita_get_color_at` |
+| Layers | `krita_list_layers`, `krita_add_layer`, `krita_set_layer`, `krita_move_layer`, `krita_duplicate_layer`, `krita_delete_layer`, `krita_merge_down` |
+| Filters | `krita_list_filters`, `krita_apply_filter` |
+
+### Strokes
+
+`krita_stroke` takes `[[x, y], ...]` points and, for that stroke only, any of: `size`, `opacity`, `flow`, `color`, `preset`, `blend_mode`, `erase`, and `layer` (name or id). Omitted settings come from `krita_set_brush` / `krita_set_color`, and the user's brush settings are restored afterwards.
+
+- `pressures`: one 0..1 value per point, for tapered, hand-drawn lines. `pressure_affects` chooses `size`, `opacity`, `both` or `none`.
+- `smooth` (default on) draws a Catmull-Rom curve through the points, so a handful of points gives a flowing line.
+- `engine="native"` (default) uses Krita's brush engine, so textured presets (pencil, crayon, pastel, chalk) keep their grain. Varying pressure is painted as short runs of equal pressure; with very transparent brushes you may see faint joins, which `pressure_affects="none"` avoids.
+- `engine="pixel"` is a simple built-in soft round brush with `hardness`; use it for crisp masks or on Krita builds without the scripting paint API.
+
+### Layers and editable sources
+
+- Build the image in named layers and groups. `inherit_alpha` gives clipping to the layers below inside a group; `alpha_locked` keeps shading inside a shape's existing pixels.
+- `krita_save("scene.kra")` keeps every layer as the editable source. PNG/JPG/WebP saves are flattened.
+- `krita_export_layers(folder)` writes one PNG per top-level layer or group plus `manifest.json` (order, opacity, blend mode, position). By default each PNG is full canvas size so parallax layers line up; `crop=true` trims each layer and records its offset.
+- `krita_get_canvas` returns a PNG preview the agent can see (pass `layer` to look at one layer).
+
+## Development
+
+```bash
+pip install pytest PyQt5
+QT_QPA_PLATFORM=offscreen python -m pytest tests
+```
+
+The tests cover the security checks, the pixel engine, the HTTP bridge (including browser-style and DNS-rebinding requests), and the full MCP → bridge → plugin path against an in-memory model of Krita's API (`tests/fake_krita.py`). That model is not real Krita, so check new Krita-API calls inside Krita.
 
 ## License
 
